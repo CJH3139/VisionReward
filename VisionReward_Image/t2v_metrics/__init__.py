@@ -5,8 +5,19 @@ from __future__ import print_function
 
 from .constants import HF_CACHE_DIR
 from .vqascore import VQAScore, list_all_vqascore_models
-from .clipscore import CLIPScore, list_all_clipscore_models
-from .itmscore import ITMScore, list_all_itmscore_models
+
+# Lazy: only import CLIPScore/ITMScore if actually used, so scoring doesn't
+# require ImageReward/hpsv2/clip when only VQAScore is needed.
+try:
+    from .clipscore import CLIPScore, list_all_clipscore_models
+except ImportError:
+    CLIPScore = None
+    def list_all_clipscore_models(): return []
+try:
+    from .itmscore import ITMScore, list_all_itmscore_models
+except ImportError:
+    ITMScore = None
+    def list_all_itmscore_models(): return []
 
 def list_all_models():
     return list_all_vqascore_models() + list_all_clipscore_models() + list_all_itmscore_models()
