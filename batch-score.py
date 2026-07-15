@@ -25,18 +25,53 @@ import json
 import argparse
 from collections import defaultdict
 
+import numpy as np
 import torch
+from tqdm import tqdm
 from sat.model.mixins import CachedAutoregressiveMixin
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils.utils import llama2_text_processor_inference, get_image_processor, llama3_tokenizer
+from utils.utils import chat, llama2_text_processor_inference, get_image_processor, llama3_tokenizer
 from utils.models import VisualLlamaEVA
+from VisionReward_Image.t2v_metrics.vqascore import VQAScore
 
-from importlib import import_module
-inference_image = import_module("inference-image")
-cal_score = inference_image.cal_score
+# Copied from inference-image.py to keep mask semantics in sync.
+MASK_INDICES = [0, 1, 2]
+MASK_FEATURE_MAP = {
+    0: [22, 23, 24, 28, 29],
+    1: [25, 26],
+    2: [27],
+}
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def cal_score_fast(args, image_path, prompt, model, text_processor_infer, image_processor,
+                   ques_data, weight, intercept, alignment_scorer):
+    """Same math as inference-image.cal_score, but takes preloaded ques/weights/scorer
+    instead of reloading them per image."""
+    answer_list = []
+    alignment = alignment_scorer(images=[image_path], texts=[prompt])[0][0].cpu().item()
+    for ques in ques_data:
+        try:
+            response, _, _ = chat(
+                image_path=image_path, image=None, model=model,
+                text_processor=text_processor_infer, img_processor=image_processor,
+                query=ques, max_length=args.max_length, top_p=args.top_p,
+                temperature=args.temperature, top_k=args.top_k,
+                invalid_slices=text_processor_infer.invalid_slices, args=args,
+            )
+            answer_list.append(response)
+        except Exception as e:
+            answer_list.append(None)
+            print(f"  Error on '{ques[:50]}...': {e}")
+    reward = [(1 if ans == 'yes<|end_of_text|>' else -1) for ans in answer_list]
+    for mask_index, feature_indices in MASK_FEATURE_MAP.items():
+        for feature_index in feature_indices:
+            reward[feature_index] *= (int)(reward[mask_index] > 0)
+    reward_filtered = [v for i, v in enumerate(reward) if i not in MASK_INDICES]
+    final_reward = [alignment] + reward_filtered
+    return float(np.dot(final_reward, weight) + intercept)
 
 
 def walk_tree(root):
@@ -160,6 +195,14 @@ def main():
     image_processor = get_image_processor(model_args.eva_args["image_size"][0])
     text_processor_infer = llama2_text_processor_inference(tokenizer, args.max_length, model.image_length)
 
+    print("Loading questions, weights, and alignment scorer (once)...")
+    with open(args.ques_file, "r") as fq:
+        ques_data = [line.strip() for line in fq]
+    with open(args.weight_file, "r") as fw:
+        w_data = json.load(fw)
+    weight, intercept = w_data["coef"], w_data["intercept"]
+    alignment_scorer = VQAScore(model="clip-flant5-xxl")
+
     fieldnames = ["image_path", "experiment", "model", "scheduler", "prompt_stem", "score"]
     write_header = not os.path.exists(args.results)
     with torch.no_grad(), open(args.results, "a", newline="", encoding="utf-8") as f:
@@ -169,7 +212,8 @@ def main():
         for i, (img_path, exp, mdl, sch, stem) in enumerate(todo, 1):
             prompt = prompt_map[stem]
             try:
-                score = cal_score(args, img_path, prompt, model, text_processor_infer, image_processor)
+                score = cal_score_fast(args, img_path, prompt, model, text_processor_infer,
+                                       image_processor, ques_data, weight, intercept, alignment_scorer)
                 print(f"[{i}/{len(todo)}] {score:.4f}  {img_path}")
                 writer.writerow({"image_path": img_path, "experiment": exp, "model": mdl,
                                  "scheduler": sch, "prompt_stem": stem, "score": score})
